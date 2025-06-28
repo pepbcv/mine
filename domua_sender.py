@@ -1,46 +1,63 @@
-# domua_sender.py
+# domua_sender.py (versione reale per DomU)
 
 import mmap
-import time
 from cffi import FFI
 
-# Inizializza CFFI
 ffi = FFI()
 
-# Carica librerie Xen
-xen = ffi.dlopen("libxenctrl.so")
+# Carica solo le librerie sicure per DomU (niente libxenctrl)
 gnttab = ffi.dlopen("libxengnttab.so")
+evtchn = ffi.dlopen("libxenevtchn.so")
 
-# Definizioni semplificate (puoi ignorarle per ora)
 ffi.cdef("""
-typedef ... xc_interface;
 typedef ... xengnttab_handle;
+typedef ... xenevtchn_handle;
 
-xc_interface *xc_interface_open(void *unused1, void *unused2, unsigned int flags);
-xengnttab_handle *xengnttab_open(xc_interface *xch, unsigned int flags);
-int xengnttab_grant_foreign_access(xengnttab_handle *h, int domid, unsigned long frame, int writable);
-void *xc_map_foreign_range(xc_interface *xch, int domid, int size, int prot, unsigned long mfn);
+xengnttab_handle *xengnttab_open(void *logger, unsigned int flags);
+int xengnttab_grant_foreign_access(xengnttab_handle *h, int domid, int writable, int *ref);
+
+xenevtchn_handle *xenevtchn_open(void *logger, unsigned int flags);
+int xenevtchn_bind_interdomain(xenevtchn_handle *xce, int remote_domid, int remote_port);
+int xenevtchn_notify(xenevtchn_handle *xce, int port);
+int xenevtchn_unmask(xenevtchn_handle *xce, int port);
+int xenevtchn_fd(xenevtchn_handle *xce);
+int xenevtchn_close(xenevtchn_handle *xce);
 """)
 
-# 1. Apri interfaccia Xen e grant table
-xch = xen.xc_interface_open(ffi.NULL, ffi.NULL, 0)
-gnt = gnttab.xengnttab_open(xch, 0)
-
-# 2. Alloca pagina di memoria (4 KB)
+# Configurazione
 PAGE_SIZE = 4096
-shm = mmap.mmap(-1, PAGE_SIZE)
+receiver_domid = 1  # <- Cambia questo col DomID di domuB
 
-# 3. Scrive un messaggio da 1024 byte
-msg = b"ciao da DomU-A" + b"." * (1024 - len("ciao da DomU-A"))
+# 1. Alloca una pagina di memoria
+shm = mmap.mmap(-1, PAGE_SIZE)
+msg = b"Messaggio da DomU-A" + b"." * (1024 - len("Messaggio da DomU-A"))
 shm.write(msg)
 
-# 4. Simula creazione grant ref (verrà implementata più avanti)
-grant_ref = 42  # <--- fittizio per ora
-receiver_domid = 1  # <--- DomU-B (da sostituire con reale DomID)
+# 2. Crea grant table
+gnt = gnttab.xengnttab_open(ffi.NULL, 0)
+ref = ffi.new("int *")
+res = gnttab.xengnttab_grant_foreign_access(gnt, receiver_domid, 1, ref)
+if res < 0:
+    print("Errore nella creazione del grant ref")
+    exit(1)
+grant_ref = ref[0]
 
-# 5. Scrivi grant_ref e domid su un file condiviso
+# 3. Crea event channel
+evch = evtchn.xenevtchn_open(ffi.NULL, 0)
+port = evtchn.xenevtchn_bind_interdomain(evch, receiver_domid, 0)
+if port < 0:
+    print("Errore nella creazione dell'event channel")
+    exit(1)
+
+# 4. Salva le info su file per DomU-B
 with open("/tmp/xen_ipc_info.txt", "w") as f:
     f.write(f"grant_ref={grant_ref}\n")
-    f.write(f"receiver_domid={receiver_domid}\n")
+    f.write(f"port={port}\n")
+    f.write(f"msg=Messaggio da DomU-A\n")
 
-print("Messaggio scritto e info salvata. (grant_ref è simulato)")
+# 5. Notifica DomU-B
+evtchn.xenevtchn_notify(evch, port)
+
+print(f"Messaggio pronto. Grant ref: {grant_ref}, Event channel: {port}")
+
+
